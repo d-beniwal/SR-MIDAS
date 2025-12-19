@@ -9,6 +9,7 @@ ps_ss_290_sr.txt
 test_data/
 j_debug_SR_workflow.ipynb
 temp_midas_dir/
+debug_super_res_process.py
 
 # C extensions
 *.so
