@@ -2,6 +2,8 @@ import os
 import subprocess
 import sys
 import shutil
+from pathlib import Path
+
 
 def run_command(command, cwd=None):
     """Helper to run shell commands with error handling."""
@@ -96,9 +98,17 @@ def install_sr_midas(repo_url, target_dir):
 if __name__ == "__main__":
     # 1. Configuring the installation directory
     current_dir = os.getcwd()
-    target_dir = os.path.join(current_dir, "FF_HEDM", "v7")
-    
-    # SR-MIDAS github repository link
-    repo_url = "https://github.com/AISDC/SR-MIDAS.git"
+    current_dir_name = str(Path.cwd().name)
+    if current_dir_name == "MIDAS":
+        target_dir = os.path.join(current_dir, "FF_HEDM", "v7")
+        
+        # SR-MIDAS github repository link
+        repo_url = "https://github.com/AISDC/SR-MIDAS.git"
 
-    install_sr_midas(repo_url, target_dir)
+        install_sr_midas(repo_url, target_dir)
+
+    else:
+        print(f"\nERROR: The current directory is not the MIDAS directory.")
+        print(f"Please start a terminal within the MIDAS directory and run the script again.")
+        print("\nExiting...\n")
+        sys.exit(1)

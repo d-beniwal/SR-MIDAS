@@ -1,5 +1,7 @@
 # SR-MIDAS
-Super resolution workflow for MIDAS reconstruction
+### Super resolution workflow for MIDAS reconstruction
+
+
 
 ## Setting up the SR workflow
 
