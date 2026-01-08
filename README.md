@@ -3,7 +3,8 @@
 
 <hr />
 
-## OPTION 1: AUTO-INSTALLATION: RECOMMENDED
+# INSTALLATION of Super-Resolution workflow
+### OPTION 1: AUTO-INSTALLATION: RECOMMENDED
 
 Download only the 'super_res_install.py' file to your local system. In future, it will be automatically included within the 'MIDAS/utils' directory.
 
@@ -17,7 +18,7 @@ python ../../super_res_install.py
 
 This will automatically install/update the super-resolution workflow.
 
-## ## OPTION 2: MANUAL INSTALLATION: NOT RECOMMENDED
+### OPTION 2: MANUAL INSTALLATION: NOT RECOMMENDED
 
 This implementation requires manually copying the files included here into an existing MIDAS installation. The target directory is as below:
 
@@ -32,8 +33,9 @@ The data to be copied is as below:
 - **super_res_process.py**: file: Python file that runs the SR workflow and is called from within the 'ff_MIDAS_sr.py'.
 - **sr_config.json**: file: Configuration file to control behaviour of SR workflow.
 
+<hr />
 
-## Running MIDAS with super-resolution
+# Running MIDAS with super-resolution
 
 ```bash
 python ~/MIDAS/FF_HEDM/v7/ff_MIDAS_sr.py \
