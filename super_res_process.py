@@ -1,3 +1,4 @@
+from typing import Any
 import numpy as np #type:ignore
 import pandas as pd #type: ignore
 import zarr #type: ignore
@@ -11,10 +12,21 @@ import torch #type:ignore
 import torch.nn as nn #type:ignore
 from torch.amp import autocast #type:ignore
 
-import os, time, datetime, logging, argparse, json, math
+import os, time, datetime, logging, argparse, json, math, sys, shutil
 from copy import deepcopy
 
 SEP = os.sep
+
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
 
 # ----------------------------
@@ -26,12 +38,13 @@ def setup_logging(resultDir):
         logger (logging.Logger): Logger object for logging messages
     """
 
-    log_dir = f"{resultDir}SRlogs{SEP}"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    log_dir = f"{resultDir}SR_out{SEP}"
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    os.makedirs(log_dir)
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filepath = f"{log_dir}peakfit_execution_{timestamp}.log"
+    log_filepath = f"{log_dir}SR_logs_{timestamp}.log"
     
     logging.basicConfig(
         level=logging.INFO,
@@ -58,6 +71,69 @@ def read_hkls_csv(hkls_csv_path):
 
     df_hkls = pd.read_csv(hkls_csv_path, sep=' ')
     return df_hkls
+
+
+# ----------------------------
+def create_rotation_matrices(tx, ty, tz):
+    """
+    Create the rotation matrices for the given rotation angles
+    Args:
+        tx (float): rotation about x-axis in degrees
+        ty (float): rotation about y-axis in degrees
+        tz (float): rotation about z-axis in degrees
+    Returns:
+        Rx (np.ndarray): rotation matrix about x-axis
+        Ry (np.ndarray): rotation matrix about y-axis
+        Rz (np.ndarray): rotation matrix about z-axis
+    """
+
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(np.deg2rad(tx)), -np.sin(np.deg2rad(tx))],
+        [0, np.sin(np.deg2rad(tx)), np.cos(np.deg2rad(tx))]
+        ])
+
+    Ry = np.array([
+        [np.cos(np.deg2rad(ty)), 0, np.sin(np.deg2rad(ty))],
+        [0, 1, 0],
+        [-np.sin(np.deg2rad(ty)), 0, np.cos(np.deg2rad(ty))]
+        ])
+
+    Rz = np.array([
+        [np.cos(np.deg2rad(tz)), -np.sin(np.deg2rad(tz)), 0],
+        [np.sin(np.deg2rad(tz)), np.cos(np.deg2rad(tz)), 0],
+        [0, 0, 1]
+        ])
+
+    return Rx, Ry, Rz
+
+
+# ----------------------------
+def create_distortion_map(RR, EE, p0, p1, p2, p3, px):
+    """
+    Create the distortion map for the given parameters
+    Args:
+        RR (np.ndarray): radial map (in microns)
+        EE (np.ndarray): polar angle map (spans from 180 to -180 degrees in clockwise direction)
+        p0 (float): distortion parameter
+        p1 (float): distortion parameter
+        p2 (float): distortion parameter
+        p3 (float): distortion parameter
+        px (float): pixel size in microns
+    Returns:
+        R_N (np.ndarray): normalized radial map in microns
+    """
+
+    RR_N = RR / np.max(RR) # Normalized radial map
+    EE_T = 90 - EE # Transformed polar angle map
+
+    # Distortion terms
+    dist_gRE = p0 * (RR_N**2) * np.cos(np.deg2rad(2*EE_T)) # 2-fold angular
+    dist_hRE = p1 * (RR_N**4) * np.cos(np.deg2rad(4*EE_T + p3)) # 4-fold angular
+    dist_kRE = p2 * (RR_N**2) # radial distortion
+    dist_fRE = 1 + dist_gRE + dist_hRE + dist_kRE # combined distortion factor
+
+    return dist_fRE
 
 
 # ----------------------------
@@ -151,15 +227,79 @@ def load_trained_CNNSR(midasVerDir, mod_dir, mod_itr, torch_devs):
     return (mod, mod_args, X_channels)
 
 
+def ringNr_map_on_detector(sr_params):
+    """ Create the ring number map on the detector. Pixels that don't belong to any ring are marked with -1.
+    Pixels that belong to a ring in sr_params["ringsToUse"] are marked with the ring index (starting from 0).
+    Args:
+        numPxY (int): number of pixels in the Y direction (horizontal direction)
+        numPxZ (int): number of pixels in the Z direction (vertical direction)
+        sr_params (dict): dictionary containing the parameters for the super-resolution process
+    Returns:
+        RingNrmap (arr): ring number map on the detector
+    """
+
+    det_shape = (sr_params["numPxZ"], sr_params["numPxY"])
+
+    # YY and ZZ are the pixel coordinates of the detector
+    # These are relative to the top left corner pixel as origin
+    YYpx, ZZpx = np.meshgrid(np.arange(0, sr_params["numPxY"]), np.arange(0, sr_params["numPxZ"]))
+
+    # yyd and zzd are the physical coordinates of the detector in microns
+    # These are relative to the beam center as origin
+    yyd = (-YYpx + sr_params["Ypx_BC"])*sr_params["pxSize"]
+    zzd = (ZZpx - sr_params["Zpx_BC"])*sr_params["pxSize"]
+
+    # xyz_comb is the combined array of x, y, z physical coordinates of the detector in microns
+    # The detector map here is flattened; first row is x, second row is y, third row is z coordinates of all pixels
+    xyz_comb = np.array([
+        np.zeros_like(yyd.flatten()),
+        yyd.flatten(),
+        zzd.flatten()
+    ])
+
+    # Create the rotation matrices
+    Rx, Ry, Rz = create_rotation_matrices(sr_params["tx"], sr_params["ty"], sr_params["tz"])
+
+    # xyz_comb_rot is the combined array of x, y, z physical coordinates of the detector in microns after rotation
+    xyz_comb_rot = (Rx @ (Ry @ Rz)) @ xyz_comb
+
+    # X, Y, Z are the cartesian lab coordinates of the detector in microns
+    XX = (sr_params["Lsd"] + xyz_comb_rot[0]).reshape(det_shape)
+    YY = xyz_comb_rot[1].reshape(det_shape)
+    ZZ = xyz_comb_rot[2].reshape(det_shape)
+
+    RR = (sr_params["Lsd"]/XX) * np.sqrt(YY**2 + ZZ**2)
+    EE = np.zeros_like(YY)
+    EE[YY <= 0] = np.rad2deg(np.arccos(ZZ[YY<=0] / (np.sqrt(YY[YY<=0]**2 + ZZ[YY<=0]**2))))
+    EE[YY > 0] = np.rad2deg(- np.arccos(ZZ[YY>0] / (np.sqrt(YY[YY>0]**2 + ZZ[YY>0]**2))))
+
+    # Create the distortion map
+    dist_fRE = create_distortion_map(RR, EE,
+                                    sr_params["p0"], sr_params["p1"], sr_params["p2"], sr_params["p3"],
+                                    sr_params["pxSize"])
+
+    Rmap = RR * dist_fRE / sr_params["pxSize"]
+
+    # 2. Create frame_RingNrmap
+    # Initialize with -1 to represent pixels that do not belong to any ring
+    RingNrmap = np.full(det_shape, -1, dtype=int)
+
+    for i, R in enumerate(sr_params["rings_to_use_Rpx"]):
+        # Mask for pixels within the allowed deviation of the current ring radius
+        ring_mask = np.abs(Rmap - R) <= (sr_params["ring_width"]/sr_params["pxSize"])
+        RingNrmap[ring_mask] = i
+
+    return (RingNrmap)
+
+
 # ----------------------------
-def patches_from_detector_frame(frame_exp, patch_size=int(20), threshold=0, connectivity_dim=8):
+def patches_from_detector_frame(frame_goodCoords, sr_config, connectivity_dim=8):
     """ extracts patches from input detector frame using connected component algorithm. First a labelled array is created where different spots\
     are marked with different label. Each spot is then isolated and pasted onto a patch of size=patch_size such that the max intensity pixel is\
     at the center of the patch.
     Args:
-        frame_exp (arr): experimental detector frame
-        patch_size (int; default=20): size of patches that are extracted
-        threshold (float; default=0): pixels below threshold are set to zero
+        frame_goodCoords (arr): experimental detector frame with good pixels (pixels that belong to a ring and exceed the threshold for that ring)
+        sr_config (dict): dictionary containing the configuration for the super-resolution process
         connectivity_dim (int; default=8): if set to 8: it accepts continuity with diagonal cells; otherwise it uses 4-connectivity only
     Returns:
         patches (arr): extracted patch array (N,patch_size,patch_size)
@@ -168,8 +308,7 @@ def patches_from_detector_frame(frame_exp, patch_size=int(20), threshold=0, conn
         nr_pixels_in_patch (list of int): no. of non-zero pixels in the patch
     """
 
-    # Create a binary mask for regions above the threshold
-    binary_mask = frame_exp > threshold
+    patch_size = sr_config["spot_find_args"]["patch_size"]
 
     # Label connected regions in the binary mask
     if connectivity_dim in [8, 8.0, "8"]:
@@ -178,10 +317,10 @@ def patches_from_detector_frame(frame_exp, patch_size=int(20), threshold=0, conn
                               [1, 1, 1],
                               [1, 1, 1]])
 
-        labeled_array, num_features = label(binary_mask, structure)
+        labeled_array, num_features = label(frame_goodCoords, structure)
         
     else:
-        labeled_array, num_features = label(binary_mask) # uses 4-connectivity
+        labeled_array, num_features = label(frame_goodCoords) # uses 4-connectivity
 
     # Find bounding boxes for each labeled region
     bounding_boxes = find_objects(labeled_array)
@@ -192,47 +331,49 @@ def patches_from_detector_frame(frame_exp, patch_size=int(20), threshold=0, conn
     patches_Y00, patches_Z00 = [], []
     nr_pixels_in_patch = []
 
-    for i, bbox in enumerate(bounding_boxes[:-1]):
+    for i, bbox in enumerate(bounding_boxes):
         if bbox is not None:  # Ensure there is a valid region
             # Extract the sub-array corresponding to the current spot
-            spot = frame_exp[bbox]
+            spot = frame_goodCoords[bbox]
 
             # Mask out values not belonging to the current spot
             spot = np.where(labeled_array[bbox] == (i + 1), spot, 0)
+            nr_pixels_in_spot = np.count_nonzero(spot)
+            
+            if nr_pixels_in_spot >= sr_config["minPxCount"]:
 
-            # Find the row, col position of the maximum intensity pixel within the spot
-            r_max_spot, c_max_spot = np.unravel_index(np.argmax(spot), spot.shape)  # (row, col)
-            Zpx_max_spot = bbox[0].start + r_max_spot
-            Ypx_max_spot = bbox[1].start + c_max_spot
+                # Find the row, col position of the maximum intensity pixel within the spot
+                r_max_spot, c_max_spot = np.unravel_index(np.argmax(spot), spot.shape)  # (row, col)
+                Zpx_max_spot = bbox[0].start + r_max_spot
+                Ypx_max_spot = bbox[1].start + c_max_spot
 
-            Z00_patch = Zpx_max_spot - int(patch_size/2)
-            Y00_patch = Ypx_max_spot - int(patch_size/2)
+                Z00_patch = Zpx_max_spot - int(patch_size/2)
+                Y00_patch = Ypx_max_spot - int(patch_size/2)
 
-            # If Z00 and Y00 are such that cropped region will be within frame boundaries
-            if (Z00_patch >= 0) and \
-                (Z00_patch < frame_exp.shape[0] - patch_size) and \
-                (Y00_patch >= 0) and \
-                (Y00_patch < frame_exp.shape[1] - patch_size):
+                # If Z00 and Y00 are such that cropped region will be within frame boundaries
+                if (Z00_patch >= 0) and \
+                    (Z00_patch < frame_goodCoords.shape[0] - patch_size) and \
+                    (Y00_patch >= 0) and \
+                    (Y00_patch < frame_goodCoords.shape[1] - patch_size):
 
+                    # Create patch by padding the spot on all sides to ensure it can be cropped properly
+                    patch = np.pad(spot, pad_width=patch_size, mode='constant', constant_values=0)
+                    
+                    # Find the row, col position of the maximum intensity pixel within the patch
+                    r_max_patch, c_max_patch = np.unravel_index(np.argmax(patch), patch.shape)  # (row, col)
 
-                # Create patch by padding the spot on all sides to ensure it can be cropped properly
-                patch = np.pad(spot, pad_width=patch_size, mode='constant', constant_values=0)
-                
-                # Find the row, col position of the maximum intensity pixel within the patch
-                r_max_patch, c_max_patch = np.unravel_index(np.argmax(patch), patch.shape)  # (row, col)
+                    # Crop the patch such that max int pixel will be at center of patch
+                    rs = int(r_max_patch - int(patch_size/2))
+                    cs = int(c_max_patch - int(patch_size/2))
+                    rf, cf = rs + patch_size, cs + patch_size
+                    patch = patch[rs:rf, cs:cf]
+                    patches.append(patch)
 
-                # Crop the patch such that max int pixel will be at center of patch
-                rs = int(r_max_patch - int(patch_size/2))
-                cs = int(c_max_patch - int(patch_size/2))
-                rf, cf = rs + patch_size, cs + patch_size
-                patch = patch[rs:rf, cs:cf]
-                patches.append(patch)
+                    patches_Z00.append(Z00_patch)
+                    patches_Y00.append(Y00_patch)
 
-                patches_Z00.append(Z00_patch)
-                patches_Y00.append(Y00_patch)
-
-                spots.append(spot)
-                nr_pixels_in_patch.append(np.count_nonzero(spot))
+                    spots.append(spot)
+                    nr_pixels_in_patch.append(np.count_nonzero(spot))
 
 
     patches = np.array(patches)
@@ -675,8 +816,9 @@ parser = argparse.ArgumentParser(description="Routine to create SR patches & per
 parser.add_argument("-midasZarrDir",type=str,  help="Directory containing the Zarr file")
 parser.add_argument("-srfac",       type=int,   default=8,  help="(1/2/4/8; def=8) Super-resolution factor")
 parser.add_argument("-SRconfig_path", type=str,   default="sr_config.json",  help="SR config file path. If not provided, the default configration file will be used")
-parser.add_argument("-midasVerDir", type=str,   default="",  help="MIDAS version directory used to create paths to trained models")
-parser.add_argument("-ps_fn", type=str,   default="",  help="Parameter file name")
+parser.add_argument("-midasVerDir", type=str,   default=".",  help="MIDAS version directory used to create paths to trained models")
+parser.add_argument("-saveSRpatches", type=int,   default=1,   help="1: Save SR patches, 0: Do not save SR patches")
+parser.add_argument("-saveFrameGoodCoords", type=int,   default=1,   help="1: Save frame goodCoords array, 0: Do not save frame goodCoords map")
 
 args, unparsed = parser.parse_known_args()
 
@@ -694,6 +836,68 @@ tf = time.time()
 t_run += tf - ts
 SRlogger.info(f"{'-'*5} Time to setup logging: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
+SRlogger.info(f"Searching for MIDAS zip file in dir: {args.midasZarrDir}")
+ts = time.time()
+midas_zip_filename = [i for i in os.listdir(args.midasZarrDir) if ".MIDAS.zip" in i][0]
+midas_zip_filepath = f"{args.midasZarrDir}{midas_zip_filename}"
+
+tf = time.time()    
+t_run += tf - ts
+SRlogger.info(f"\t|Found MIDAS zip file: {midas_zip_filename}")
+SRlogger.info(f"{'-'*5} Time to find MIDAS zip file: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+
+SRlogger.info(f"Loading Zarr file: {midas_zip_filename}")
+ts = time.time()
+zf= zarr.open(midas_zip_filepath,"r")
+
+SRlogger.info(f"\t|Extracting parameters needed for super-res workflow")
+zf_process_params = zf["analysis"]["process"]["analysis_parameters"]
+zf_scan_params = zf["measurement/process/scan_parameters"]
+
+sr_params = {}
+sr_params["Ypx_BC"] = float(zf_process_params["YCen"][0])
+sr_params["Zpx_BC"] = float(zf_process_params["ZCen"][0])
+sr_params["ringsToUse"] = list(zf_process_params["RingThresh"][:][:,0].astype(int))
+sr_params["ringsThresh"] = list(zf_process_params["RingThresh"][:][:,1].astype(float))
+sr_params["spacegroup"] = int(zf_process_params["SpaceGroup"][0])
+sr_params["lattParam"] = list(zf_process_params["LatticeParameter"][:].astype(float))
+sr_params["xrayLambda"] = float(zf_process_params["Wavelength"][0]) # in Angstrom
+sr_params["Lsd"] = float(zf_process_params["Lsd"][0])
+sr_params["pxSize"] = float(zf_process_params["PixelSize"][0])
+sr_params["tx"] = float(zf_process_params["tx"][0])
+sr_params["ty"] = float(zf_process_params["ty"][0])
+sr_params["tz"] = float(zf_process_params["tz"][0])
+sr_params["p0"] = float(zf_process_params["p0"][0])
+sr_params["p1"] = float(zf_process_params["p1"][0])
+sr_params["p2"] = float(zf_process_params["p2"][0])
+sr_params["p3"] = float(zf_process_params["p3"][0])
+sr_params["ring_width"] = float(zf_process_params["Width"][0])
+sr_params["omega_start"] = float(zf_scan_params["start"][0])
+sr_params["omega_stepsize"] = float(zf_scan_params["step"][0])
+sr_params["numPxY"] = int(zf["exchange"]["data"].shape[2])
+sr_params["numPxZ"] = int(zf["exchange"]["data"].shape[1])
+
+sr_params["padding"] = 6
+if "Padding" in zf_process_params:
+    sr_params["padding"] = int(zf_process_params["Padding"][0])
+
+sr_params["SkipFrame"] = 0
+if "SkipFrame" in zf_process_params:
+    sr_params["SkipFrame"] = int(zf_process_params["SkipFrame"][0])
+
+sr_params["ImTransOpt"] = 0
+if "ImTransOpt" in zf_process_params:
+    sr_params["ImTransOpt"] = int(zf_process_params["ImTransOpt"][0])
+
+SRlogger.info(f"\t|Loading Zarr data")
+exData = np.array(zf["exchange"]["data"])[sr_params["SkipFrame"]:] # Skip first 'SkipFrame' frames
+
+del zf
+tf = time.time()
+t_run += tf - ts
+SRlogger.info(f"\t|Nr of frames={exData.shape[0]}; after skipping {sr_params['SkipFrame']} frames")
+SRlogger.info(f"{'-'*5} Time to load midas zip file: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+
 
 SRlogger.info(f"Loading default super-resolution configuration file: {args.SRconfig_path}")
 ts = time.time()
@@ -710,90 +914,79 @@ else:
     SRlogger.error(f"SR config file must be a .json or .txt file.")
     sys.exit(1)
 
+
+if "paramFN" in zf_process_params:
+    ps_fn = zf_process_params["paramFN"][0].decode('utf-8')
+    pf_fp = os.path.join(args.midasZarrDir, ps_fn)
+
 """Below code is used to update the SR config with the parameters from the parameter text file
 # Currently disabled since the ps_fn obtained from ff_MIDAS_sr.py is not getting read correctly.
 
-SRlogger.info(f"Updating SR config with parameters from midas parameter file: {args.ps_fn}")
+SRlogger.info(f"Updating SR config with parameters from midas parameter file: {pf_fp}")
 
-if os.path.exists(args.ps_fn):
-    sr_config_in_ps = parse_sr_config_txt(args.ps_fn)
+if os.path.exists(pf_fp):
+    sr_config_in_ps = parse_sr_config_txt(pf_fp)
     update_nested_dict(sr_config, sr_config_in_ps)
 else:
-    SRlogger.warning(f"Parameter file not found: {args.ps_fn}. Skipping parameter file update.")
+    SRlogger.warning(f"Parameter file not found: {pf_fp}. Skipping parameter file update.")
 """
 
+sr_config_savepath = os.path.join(args.midasZarrDir, "SR_out", "sr_config.json")
+with open(sr_config_savepath, "w") as f:
+    json.dump(sr_config, f, indent=4, cls=NumpyEncoder)
+SRlogger.info(f"\t|Super-resolution configuration file saved to: {sr_config_savepath}")
+
+sr_params_savepath = os.path.join(args.midasZarrDir, "SR_out", "sr_params.json")
+with open(sr_params_savepath, "w") as f:
+    json.dump(sr_params, f, indent=4, cls=NumpyEncoder)
+SRlogger.info(f"\t|Super-resolution parameters file saved to: {sr_params_savepath}")
+
 tf = time.time()    
 t_run += tf - ts
-SRlogger.info(f"{'-'*5} Time to load SR config: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-
-SRlogger.info(f"Searching for MIDAS zip file in dir: {args.midasZarrDir}")
-ts = time.time()
-midas_zip_filename = [i for i in os.listdir(args.midasZarrDir) if ".MIDAS.zip" in i][0]
-midas_zip_filepath = f"{args.midasZarrDir}{midas_zip_filename}"
-tf = time.time()    
-t_run += tf - ts
-SRlogger.info(f"\t|Found MIDAS zip file: {midas_zip_filename}")
-SRlogger.info(f"{'-'*5} Time to find MIDAS zip file: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-
-SRlogger.info(f"Loading Zarr data & analysis parameters: {midas_zip_filename}")
-ts = time.time()
-zf= zarr.open(midas_zip_filepath,"r")
-exData = np.array(zf["exchange"]["data"])
-params = zf["analysis"]["process"]["analysis_parameters"]
-del zf
-tf = time.time()
-t_run += tf - ts
-SRlogger.info(f"\t|Nr of frames={exData.shape[0]}")
-SRlogger.info(f"{'-'*5} Time to load midas zip file: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
-
-SRlogger.info(f"Extracting parameters needed for super-res workflow")
-ts = time.time()
-sr_params = {}
-sr_params["Ypx_BC"] = float(params["YCen"][0])
-sr_params["Zpx_BC"] = float(params["ZCen"][0])
-sr_params["ringsToUse"] = list(params["RingThresh"][:][:,0].astype(int))
-sr_params["spacegroup"] = int(params["SpaceGroup"][0])
-sr_params["lattParam"] = list(params["LatticeParameter"][:].astype(float))
-sr_params["xrayLambda"] = float(params["Wavelength"][0]) # in Angstrom
-sr_params["Lsd"] = float(params["Lsd"][0])
-sr_params["pxSize"] = float(params["PixelSize"][0])
-sr_params["SkipFrame"] = list(params["SkipFrame"][:].astype(int))
-tf = time.time()
-t_run += tf - ts
-SRlogger.info(f"{'-'*5} Time to extract parameters: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
-
+SRlogger.info(f"{'-'*5} Time to load, update & save SR config: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
 SRlogger.info(f"Reading ring positions from '{args.midasZarrDir}hkls.csv'")
 ts = time.time()
 df_hkls = read_hkls_csv(f"{args.midasZarrDir}hkls.csv")
 rings_Rpx = (df_hkls["Radius"].unique() / sr_params["pxSize"]).tolist()
 
-ring_R_values = [rings_Rpx[int(i)-1] for i in (sr_params['ringsToUse'])]
+rings_to_use_Rpx = [rings_Rpx[int(i)-1] for i in (sr_params['ringsToUse'])]
+sr_params["rings_to_use_Rpx"] = rings_to_use_Rpx
+
 tf = time.time()
 t_run += tf - ts
-SRlogger.info(f"Ring radii (px) {ring_R_values}")
+SRlogger.info(f"Ring radii (px) {rings_to_use_Rpx}")
 SRlogger.info(f"{'-'*5} Time to calculate ring radii: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
 
-SRlogger.info(f"Creating list of frame indices to be used for analysis")
+SRlogger.info(f"Creating detector RingNr map (after tilt/distortion corrections)")
 ts = time.time()
-framesIdx = [int(i) for i in np.arange(0, exData.shape[0], 1)
-             if (i+1) not in sr_params["SkipFrame"]]
-
+RingNrmap = ringNr_map_on_detector(sr_params)
+RingNrmap_savepath = os.path.join(args.midasZarrDir, "SR_out", "RingNrmap.npy")
+np.save(RingNrmap_savepath, RingNrmap)
+SRlogger.info(f"\t|Detector RingNr map saved to: {RingNrmap_savepath}")
 tf = time.time()
 t_run += tf - ts
-SRlogger.info(f"{'-'*5} Time to compile frame indices: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+SRlogger.info(f"{'-'*5} Time to create detector RingNr map: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
 
 ts = time.time()
 peaks_csv_dir = f"{args.midasZarrDir}Temp{SEP}"
-if not os.path.isdir(peaks_csv_dir):
-    os.mkdir(peaks_csv_dir) # create new output directory
-    SRlogger.info(f"Created 'Temp' folder in MIDAS directory (peaks csv files will be saved here)'")
+if sr_config["skipFitIfExists"].lower() in ["no", "n", "false", "f", "0"]:
+    # Delete the peaks csvfolder if it exists
+    if os.path.isdir(peaks_csv_dir):
+        shutil.rmtree(peaks_csv_dir)
+        SRlogger.info(f"Deleted existing 'Temp' folder in MIDAS directory")
+    os.mkdir(peaks_csv_dir)
+    SRlogger.info(f"Created new 'Temp' folder in MIDAS directory (peaks csv files will be saved here)'")
 else:
-    SRlogger.info(f"Temp folder already exists in MIDAS directory")
+    # Create the peaks csv folder if it does not exist
+    # But if it exists, do not create it again
+    if not os.path.isdir(peaks_csv_dir):
+        os.mkdir(peaks_csv_dir) # create new output directory
+        SRlogger.info(f"Created 'Temp' folder in MIDAS directory (peaks csv files will be saved here)'")
+    else:
+        SRlogger.info(f"Temp folder already exists in MIDAS directory. Skipping peak fitting for frames that already have csv files.")
+
 tf = time.time()
 t_run += tf - ts
 SRlogger.info(f"{'-'*5} 'Temp' directory setup completed in {tf - ts:.5f}s | SR_run_time: {t_run:.5f}s")
@@ -837,8 +1030,8 @@ col_names = ["SpotID", "IntegratedIntensity", "Omega(degrees)", "YCen(px)", "ZCe
 
 SRlogger.info(f"Calculating omega stepsize based on the number of frames in the data.")
 nr_frames = exData.shape[0]
-omega_stepsize = 360 / (nr_frames - 1)
-SRlogger.info(f"\t|Nr. frames={nr_frames} | Omega stepsize={omega_stepsize}")
+
+SRlogger.info(f"\t|Nr. frames={nr_frames} | Omega start={sr_params["omega_start"]} | Omega stepsize={sr_params["omega_stepsize"]}")
 
 SRlogger.info(f"Getting Y-Z peak position pixel shift values to be used due to super-resolution factor")
 shiftYpx = sr_config["shift_YZ_pos"][f"SRx{args.srfac}"]["shiftYpx"]
@@ -846,32 +1039,76 @@ shiftZpx = sr_config["shift_YZ_pos"][f"SRx{args.srfac}"]["shiftZpx"]
 SRlogger.info(f"\t|shiftYpx: {shiftYpx}, shiftZpx: {shiftZpx}")
 
 
-for frame_i in framesIdx:
+for frame_i in range(0, nr_frames):
     t0_frame = time.time()
     SRlogger.info(f"{'='*60}")
     SRlogger.info(f"{'*'*5} Processing frame {frame_i} {'*'*5} ")
 
-    frame_i_csv_savename = f"{midas_zip_filename}_{str(frame_i).zfill(6)}_PS.csv"
+    frame_i_csv_savename = f"{midas_zip_filename}_{str(frame_i+1).zfill(sr_params["padding"])}_PS.csv"
     frame_i_csv_savepath = f"{peaks_csv_dir}{frame_i_csv_savename}"
+
+    df_peaks_frame_i = pd.DataFrame(columns=col_names)
 
     # Skip if csv file already exists provided skipIfExists is set to 'yes'
     if sr_config["skipFitIfExists"].lower() in ["yes", "y", "true", "t", "1"] and os.path.isfile(frame_i_csv_savepath):
         SRlogger.info(f"{'*'*5}| Frame {frame_i} skipped as csv file already exists.")
         continue
 
-    SRlogger.info(f"\t| Extracting patches from frame {frame_i}")
-    
+    frame_arr = exData[frame_i]
+    if sr_params["ImTransOpt"] != 0:
+        SRlogger.info(f"\t| Image ransformation for frame {frame_i} (ImTransOpt={sr_params["ImTransOpt"]})")
+
+    if sr_params["ImTransOpt"] == 1:
+        SRlogger.info(f"\t    | Flipping image horizontally | ImTransOpt=1")
+        frame_arr = np.flip(frame_arr, axis=1)
+
+    if sr_params["ImTransOpt"] == 2:
+        SRlogger.info(f"\t    | Flipping image vertically | ImTransOpt=2")
+        frame_arr = np.flip(frame_arr, axis=0)
+
+    if sr_params["ImTransOpt"] == 3:
+        SRlogger.info(f"\t    | Transpose image | ImTransOpt=3")
+        frame_arr = np.transpose(frame_arr)
+
+    SRlogger.info(f"\t| Creating goodCoords map for pixels that belong to a ring and exceed the threshold for that ring")
+    ts = time.time()
+    frame_goodCoords = np.zeros_like(frame_arr)
+    for ring_i, ring_thresh in enumerate(sr_params["ringsThresh"]):
+        # Mask for pixels that belong to the current ring and exceed the threshold for that ring
+        valid_pixels_mask = (RingNrmap == ring_i) & (frame_arr >= ring_thresh)
+        
+        # Set the goodCoords for the valid pixels to the frame_arr value for that pixel
+        frame_goodCoords[valid_pixels_mask] = frame_arr[valid_pixels_mask]
+
+    if args.saveFrameGoodCoords == 1:
+        frame_goodCoords_save_dirpath = os.path.join(args.midasZarrDir, "SR_out", "frame_goodCoords")
+        if not os.path.isdir(frame_goodCoords_save_dirpath):
+            os.mkdir(frame_goodCoords_save_dirpath)
+            SRlogger.info(f"Created 'frame_goodCoords' folder in MIDAS directory (frame goodCoords maps will be saved here)'")
+
+        frame_goodCoords_savepath = os.path.join(frame_goodCoords_save_dirpath, f"{str(frame_i).zfill(sr_params["padding"])}_GC.npy")
+        np.save(frame_goodCoords_savepath, frame_goodCoords)
+        SRlogger.info(f"\t|Frame goodCoords map saved to: {frame_goodCoords_savepath}")
+
+    tf = time.time()
+    t_run += tf - ts
+    SRlogger.info(f"{'-'*5} Time to create goodCoords map: {tf - ts:.5f} s | SR_run_time: {t_run:.5f} s")
+
+    SRlogger.info(f"\t| Extracting patches using goodCoords computed from frame {frame_i}")
     ts = time.time()
 
     patches_exp, patches_Z00, patches_Y00, nr_pixels_in_patch = \
-            patches_from_detector_frame(exData[frame_i],
-                                        patch_size=sr_config["spot_find_args"]["patch_size"],
-                                        threshold=sr_config["spot_find_args"]["threshold"],
-                                        connectivity_dim=8)
+            patches_from_detector_frame(frame_goodCoords, sr_config, connectivity_dim=8)
     
+    n_patches = len(patches_exp) # np. of patches
+
+    if n_patches == 0:
+        SRlogger.info(f"\t| No patches found in frame {frame_i}")
+        df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
+        continue
+
     patches_exp = np.expand_dims(patches_exp, axis=1) # expand dimension to make this ready as input for SR model
     patches_Isum = np.sum(patches_exp, axis=(1,2,3)).tolist()
-    n_patches = len(patches_exp) # np. of patches
 
     tf = time.time()
     t_run += tf - ts
@@ -1001,7 +1238,8 @@ for frame_i in framesIdx:
                         #SRx8_pred_batch = x8mod.forward(X_batch).detach().cpu().numpy()
                         SRx8_pred_batch = x8mod.forward(X_batch)
                         current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))  # Shape: [248]
-                        target_sums = torch.tensor(patches_Isum, device=SRx8_pred_batch.device)
+                        batch_target_sums = patches_Isum[i_s:i_f] 
+                        target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
                         scaling_factors = target_sums / current_sums
                         scaling_factors = scaling_factors.view(-1, 1, 1, 1)
                         SRx8_pred_batch = SRx8_pred_batch * scaling_factors
@@ -1024,7 +1262,8 @@ for frame_i in framesIdx:
                         #SRx8_pred_batch = x8mod.forward(X_batch).detach().cpu().numpy()
                         SRx8_pred_batch = x8mod.forward(X_batch)
                         current_sums = torch.sum(SRx8_pred_batch, dim=(1, 2, 3))  # Shape: [248]
-                        target_sums = torch.tensor(patches_Isum, device=SRx8_pred_batch.device)
+                        batch_target_sums = patches_Isum[i_s:i_f] 
+                        target_sums = torch.tensor(batch_target_sums, device=SRx8_pred_batch.device)
                         scaling_factors = target_sums / current_sums
                         scaling_factors = scaling_factors.view(-1, 1, 1, 1)
                         SRx8_pred_batch = SRx8_pred_batch * scaling_factors
@@ -1051,11 +1290,33 @@ for frame_i in framesIdx:
         patches_to_fit = SRx8_pred
         SRlogger.info(f"\t| Using SRx8 predicted patches for peak analysis")
 
+    
+    # Save SR patches to disk
+    if args.saveSRpatches == 1:
+
+        SR_patch_save_dirpath = f"{args.midasZarrDir}SR_out{SEP}SR_patches{SEP}"
+        if not os.path.isdir(SR_patch_save_dirpath):
+            os.mkdir(SR_patch_save_dirpath) # create new output directory
+            SRlogger.info(f"Created 'SR_out/SR_patches/' folder in MIDAS directory (SR patches will be saved here)'")
+        else:
+            SRlogger.info(f"SR_out/SR_patches/ folder already exists in MIDAS directory")
+
+        SRlogger.info(f"\t| Saving SR patches to disk: {SR_patch_save_dirpath}")
+
+        ts = time.time()
+        np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params["padding"])}_SRx1_exp.npy", patches_exp)
+        np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params["padding"])}_SRx2_pred.npy", SRx2_pred)
+        np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params["padding"])}_SRx4_pred.npy", SRx4_pred)
+        np.save(f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params["padding"])}_SRx8_pred.npy", SRx8_pred)
+
+        tf = time.time()
+        t_run += tf - ts
+        SRlogger.info(f"{'-'*5} Time to save SR patches to disk: {tf - ts:.5f} s | frame_time: {tf - t0_frame:.5f} s | SR_run_time: {t_run:.5f} s")
 
     ts = time.time()
     spotID = int(0)
-    omega = 180 - (omega_stepsize) * (frame_i - 1)
-    df_peaks_frame_i = pd.DataFrame(columns=col_names)
+    orig_frame_index = frame_i + sr_params["SkipFrame"]
+    omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
 
     SRlogger.info(f"\t| Initiating peak fitting process for frame {frame_i}")
     if str(sr_config["fitPeakShapePV"]).lower() in ["no", "n", "false", "f", "0"]:
@@ -1073,24 +1334,21 @@ for frame_i in framesIdx:
     R_patches = np.sqrt((sr_params["Ypx_BC"] - (np.array(patches_Y00) + sr_config["spot_find_args"]["patch_size"]/2))**2 +
                         (sr_params["Zpx_BC"] - (np.array(patches_Z00) + sr_config["spot_find_args"]["patch_size"]/2))**2)
 
-    # Find indices of patches that belong to a possible ring
-    patches_Idx_for_fitting = [i for (i, R_patch) in enumerate(R_patches) if \
-                                min(np.abs(np.array(ring_R_values) - R_patch)) < sr_config["R_deviation"]]
-
-    for patch_i in patches_Idx_for_fitting:
-        patch = patches_to_fit[patch_i,0]
+    n_peaks_in_patches_list = []
+    for patch_i in range(len(patches_to_fit)):
+        patch = patches_to_fit[patch_i, 0]
         Z00, Y00 = patches_Z00[patch_i], patches_Y00[patch_i]
 
-        if (str(sr_config["fitPeakShapePV"]).lower() not in ["yes", "y", "true", "t", "1"]):
-            patch_for_locmax = gaussian_filter(patch, sigma=sr_config["peak_find_args"]["gauss_filter_sigma"][f"SRx{args.srfac}"])
-            patch_for_locmax = median_filter(patch_for_locmax, size=sr_config["peak_find_args"]["median_filter_size"][f"SRx{args.srfac}"])
+        patch_for_locmax = gaussian_filter(patch, sigma=sr_config["peak_find_args"]["gauss_filter_sigma"][f"SRx{args.srfac}"])
+        patch_for_locmax = median_filter(patch_for_locmax, size=sr_config["peak_find_args"]["median_filter_size"][f"SRx{args.srfac}"])
 
-            locmax_peak_coords = peak_local_max(patch_for_locmax,
+        locmax_peak_coords = peak_local_max(patch_for_locmax,
                                                 min_distance=sr_config["peak_find_args"]["min_d"][f"SRx{args.srfac}"],
                                                 threshold_rel=sr_config["peak_find_args"]["thresh_rel"][f"SRx{args.srfac}"])
             
-            n_peaks_in_patch = len(locmax_peak_coords)
-
+        n_peaks_in_patch = len(locmax_peak_coords)
+        n_peaks_in_patches_list.append(n_peaks_in_patch)
+        
         if (str(sr_config["fitPeakShapePV"]).lower() in ["no", "n", "false", "f", "0"]) or\
             (str(sr_config["fitPeakShapePV"]).lower() in ["auto", "partial", "mix"] and n_peaks_in_patch == 1):
 
@@ -1110,8 +1368,8 @@ for frame_i in framesIdx:
                 watershed_peaks(patch, locmax_peak_coords,
                                 mask_thresh=sr_config["peak_find_args"]["thresh_rel"][f"SRx{args.srfac}"])
 
-            n_peaks_in_patch = len(com_coords)
-            for (peak_i, peak_label) in zip(range(n_peaks_in_patch), peak_label_values):
+            n_peaks_in_patch_after_ws = len(com_coords)
+            for (peak_i, peak_label) in zip(range(n_peaks_in_patch_after_ws), peak_label_values):
                 spotID += 1
 
                 # Segment out the current peak from the patch
@@ -1159,14 +1417,7 @@ for frame_i in framesIdx:
                 peak_data = [spotID, IntegratedIntensity, omega, YCen_px, ZCen_px, IMax, R, Eta, SigmaR, SigmaEta, NrPixels, TotalNrPixelsInPeakRegion, n_peaks_in_patch, maxY, maxZ, diffY, diffZ]
 
                 # Add to peaks dataframe only if Eta is within the range of minEta and if the number of pixels is greated than the minimum needed for a peak
-                if sr_config["minEta"] == 0:
-                    # No need to check filtering criteria for Eta; just add the peak if it has enough pixels
-                    if TotalNrPixelsInPeakRegion >= sr_config["minPxCount"]:
-                        df_peaks_frame_i.loc[spotID-1] = peak_data
-                else:
-                    # Check filtering criteria
-                    if (sr_config["minEta"] <= abs(Eta) <= (180 - sr_config["minEta"])) and (TotalNrPixelsInPeakRegion >= sr_config["minPxCount"]):
-                        df_peaks_frame_i.loc[spotID-1] = peak_data
+                df_peaks_frame_i.loc[spotID-1] = peak_data
 
 
         if (str(sr_config["fitPeakShapePV"]).lower() in ["yes", "y", "true", "t", "1"]) or\
@@ -1239,23 +1490,26 @@ for frame_i in framesIdx:
                     diffZ = maxZ - ZCen_px
                     peak_data = [spotID, IntegratedIntensity, omega, YCen_px, ZCen_px, IMax, R, Eta, SigmaR, SigmaEta, NrPixels, TotalNrPixelsInPeakRegion, n_peaks_in_patch, maxY, maxZ, diffY, diffZ]
 
-                    # Add to peaks dataframe only if Eta is within the range of minEta and if the number of pixels is greated than the minimum needed for a peak
-                    if sr_config["minEta"] == 0:
-                        # No need to check filtering criteria for Eta; just add the peak if it has enough pixels
-                        if TotalNrPixelsInPeakRegion >= sr_config["minPxCount"]:
-                            df_peaks_frame_i.loc[spotID-1] = peak_data
-                    else:
-                        # Check filtering criteria
-                        if (sr_config["minEta"] <= abs(Eta) <= (180 - sr_config["minEta"])) and (TotalNrPixelsInPeakRegion >= sr_config["minPxCount"]):
-                            df_peaks_frame_i.loc[spotID-1] = peak_data
+                    df_peaks_frame_i.loc[spotID-1] = peak_data
 
-            except:
-                SRlogger.info(f"\tFrame {frame_i}: Patch {patch_i} skipped as pseudoVoigt fit did not converge.")
-
+            except Exception as e:
+                SRlogger.warning(f"\tFrame {frame_i}: Patch {patch_i} skipped as pseudoVoigt fit did not converge. Error: {e}") 
+    
     tf = time.time()
     t_run += tf - ts
     SRlogger.info(f"{'-'*5} Time to fit peaks (frame {frame_i}): {tf - ts:.5f} s | frame_time: {tf - t0_frame:.5f} s | SR_run_time: {t_run:.5f} s")
 
+    if args.saveSRpatches == 1:
+        patches_info_fp = f"{SR_patch_save_dirpath}{str(frame_i).zfill(sr_params["padding"])}_patches_info.csv"
+        patches_info_df = pd.DataFrame({
+            "Y00": patches_Y00,
+            "Z00": patches_Z00,
+            "nr_pixels_in_patch": nr_pixels_in_patch,
+            "patches_Isum": patches_Isum,
+            "n_peaks_in_patches": n_peaks_in_patches_list
+        })
+        patches_info_df.to_csv(patches_info_fp)
+        SRlogger.info(f"\t| Saved SR patches information: {patches_info_fp}")
+
 
     df_peaks_frame_i.to_csv(frame_i_csv_savepath, sep="\t", index=False)
-
