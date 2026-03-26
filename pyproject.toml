@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sr-midas"
+dynamic = ["version"]
+description = "Super-resolution CNN workflow for MIDAS high-energy X-ray diffraction data"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["XRD", "HEDM", "super-resolution", "diffraction", "CNN", "MIDAS"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+    "h5py>=3.11.0",
+    "zarr>=2.18.2",
+    "scipy>=1.13.1",
+    "scikit-image>=0.23.2",
+    "scikit-learn>=1.2.2",
+    "matplotlib>=3.8.4",
+    "tqdm>=4.66.4",
+    "torch>=2.4.0",
+]
+
+[project.optional-dependencies]
+optuna = ["optuna>=3.0"]
+all    = ["sr-midas[optuna]"]
+dev    = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.3"]
+
+[project.scripts]
+sr-midas-create-peakbank   = "sr_midas._cli.create_peakbank_cli:main"
+sr-midas-create-patchstore = "sr_midas._cli.create_patchstore_cli:main"
+sr-midas-train             = "sr_midas._cli.train_cli:main"
+sr-midas-hp-optimize       = "sr_midas._cli.hp_optimize_cli:main"
+sr-midas-predict           = "sr_midas._cli.predict_cli:main"
+sr-midas-create-pred-pst   = "sr_midas._cli.create_pred_patchstore_cli:main"
+sr-midas-process           = "sr_midas._cli.sr_process_cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: end-to-end test requiring MIDAS data on disk",
+]
+
+[tool.hatch.version]
+path = "src/sr_midas/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sr_midas"]
+# Include non-Python data files (model weights and train args)
+artifacts = [
+    "src/sr_midas/models/cnnsr/*.json",
+    "src/sr_midas/models/cnnsr/pretrained/**/*.pth",
+    "src/sr_midas/models/cnnsr/pretrained/**/*.json",
+]
