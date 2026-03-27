@@ -77,6 +77,104 @@ sr-midas-process              # apply trained model to full MIDAS data
 
 ---
 
+## Adding SR-MIDAS worflow to MIDAS FF-HEDM workflow
+NOTE: This requires modification of ff_MIDAS.py file and should be carried out very carefully.
+
+Add following additional arguments to argument paser in ff_MIDAS.py:
+
+```
+    # Adding additional arguments for SR-MIDAS workflow --------------------------
+
+    parser.add_argument("-runSR", type=int, required=False, default=0, 
+                        help="(default=0) To enable super-resolution workflow, set to 1.")
+
+    parser.add_argument("-srfac", type=int, required=False, default=8, 
+                        help="(default 8) Super resolution factor. Options: [2, 4, 8]")
+
+    parser.add_argument("-SRconfig_path", type=str, required=False, default="auto", 
+                        help="(default 'auto') Full path to the super resolution configuration (.json) file.
+                        If not provided, the default configuraton built into the SR-MIDAS will be used")
+
+    parser.add_argument("-saveSRpatches", type=int, required=False, default=0, 
+                        help="(default 0) To save predicted SR patches, set to 1.")
+
+    parser.add_argument("-saveFrameGoodCoords", type=int, required=False, default=0, 
+                        help="(default 0) To save GoodCoords map for each frame, set to 1.\
+                            The goodCoords map filters the pixels that belong to rings")
+
+    # --------------------------
+```
+
+Create following additional variables from arguments:
+
+```
+    # Additional variables for SR-MIDAS workflow --------------------------
+    runSR = args.runSR
+    srfac = args.srfac
+    SRconfig_path = args.SRconfig_path
+    saveSRpatches = args.saveSRpatches
+    saveFrameGoodCoords = args.saveFrameGoodCoords
+    # --------------------------
+
+```
+
+For both the batch mode and standard mode, when calling process_layer(....) function, pass following additional variables:
+
+```
+    try:
+        process_layer(...,
+            runSR=runSR,
+            srfac=srfac,
+            SRconfig_path=SRconfig_path,
+            saveSRpatches=saveSRpatches,
+            saveFrameGoodCoords=saveFrameGoodCoords
+        )
+```
+
+The last step is to modify the process_layer() function itself to create a route for super-resolution workflow. Modify the function definition to include the additional variables:
+
+```
+def process_layer(.....,
+                  runSR: int, srfac: int, SRconfig_path: str, saveSRpatches: int, saveFrameGoodCoords: int,
+                  grains_file: str = '') -> None:
+
+    ....
+    ....
+    if provide_input_all == 0:
+        if do_peak_search == 1:
+            logger.infor(....)
+            try:
+                ...
+            except ..:
+                raise ...
+        
+        # Add the modification route for SR-MIDAS workflow --------------------------
+
+        elif (do_peak_search == 0) and (runSR == 1):
+
+            logger.info(f"Running super resolution. Time till now: {time.time() - t0}")
+            from sr_midas.pipeline.sr_process import run_sr_process
+            
+            sr_process_args = {}
+            sr_process_args['midasZarrDir'] = result_dir
+            sr_process_args['srfac'] = srfac
+
+            if SRconfig_path != 'auto':
+                # 'SRconfig_path' variable will be passed only if it is not the default value
+                sr_process_args['SRconfig_path'] = SRconfig_path 
+
+            sr_process_args['saveSRpatches'] = saveSRpatches
+            sr_process_args['saveFrameGoodCoords'] = saveFrameGoodCoords
+
+            try:
+                run_sr_process(**sr_process_args)
+            except Exception as e:
+                logger.error(f"Failed to execute SR-MIDAS workflow: {e}")
+                return None
+        # --------------------------
+```
+
+
 ## Command-Line Interface
 
 ### 1. Create Peakbank
