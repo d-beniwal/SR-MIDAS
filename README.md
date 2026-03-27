@@ -196,8 +196,8 @@ python ../MIDAS/FF-HEDM/workflows/ff_MIDAS.py \
 
 The above command will SR worflow with default in-built configuration in SR-MIDAS. You can pass optional arguments to control your SR workflow:
 
-| Key | Description | Default | Options
-|---|---|
+| Key | Description | Default | Options |
+|---|---|---|---|
 | `-srfac` | super-resolution factor | 8 | {2, 4, 8} |
 | `-SRconfig_path` | Path to .json configuration file for super-resolution workflow | "auto" | Full path to .json SR configuration file |
 | `-saveSRpatches` | Controls if predicted SR patches are saved (if =1) | 0 | {0, 1} |
