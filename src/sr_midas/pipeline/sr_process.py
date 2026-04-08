@@ -104,15 +104,33 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
     sr_params["tx"] = float(zf_process_params["tx"][0])
     sr_params["ty"] = float(zf_process_params["ty"][0])
     sr_params["tz"] = float(zf_process_params["tz"][0])
-    sr_params["p0"] = float(zf_process_params["p0"][0])
-    sr_params["p1"] = float(zf_process_params["p1"][0])
-    sr_params["p2"] = float(zf_process_params["p2"][0])
-    sr_params["p3"] = float(zf_process_params["p3"][0])
+    # Distortion parameters p0-p14 (MIDAS default: 0.0 for all)
+    for pi in range(0, 15):
+        key = f"p{pi}"
+        sr_params[key] = float(zf_process_params[key][0]) if key in zf_process_params else 0.0
+
     sr_params["ring_width"] = float(zf_process_params["Width"][0])
     sr_params["omega_start"] = float(zf_scan_params["start"][0])
     sr_params["omega_stepsize"] = float(zf_scan_params["step"][0])
     sr_params["numPxY"] = int(zf["exchange"]["data"].shape[2])
     sr_params["numPxZ"] = int(zf["exchange"]["data"].shape[1])
+
+    # RhoD: distortion normalization distance (MIDAS default: NrPixels * PixelSize)
+    if "RhoD" in zf_process_params:
+        sr_params["RhoD"] = float(zf_process_params["RhoD"][0])
+    elif "MaxRingRad" in zf_process_params:
+        sr_params["RhoD"] = float(zf_process_params["MaxRingRad"][0])
+    else:
+        sr_params["RhoD"] = max(sr_params["numPxY"], sr_params["numPxZ"]) * sr_params["pxSize"]
+
+    # Beam current scaling (MIDAS default: 1.0 = no scaling)
+    sr_params["bc"] = float(zf_process_params["ReferenceRingCurrent"][0]) if "ReferenceRingCurrent" in zf_process_params else 1.0
+
+    # Intensity saturation threshold (MIDAS default: 14000)
+    sr_params["IntSat"] = float(zf_process_params["UpperBoundThreshold"][0]) if "UpperBoundThreshold" in zf_process_params else 14000.0
+
+    # Bad pixel intensity marker (MIDAS default: 0 = disabled)
+    sr_params["BadPxIntensity"] = float(zf_process_params["BadPxIntensity"][0]) if "BadPxIntensity" in zf_process_params else 0.0
 
     sr_params["padding"] = 6
     if "Padding" in zf_process_params:
@@ -122,14 +140,85 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
     if "SkipFrame" in zf_process_params:
         sr_params["SkipFrame"] = int(zf_process_params["SkipFrame"][0])
 
-    sr_params["ImTransOpt"] = 0
+    # ImTransOpt as array for sequential application (MIDAS default: empty = no transforms)
     if "ImTransOpt" in zf_process_params:
-        sr_params["ImTransOpt"] = int(zf_process_params["ImTransOpt"][0])
+        sr_params["ImTransOpt"] = list(np.array(zf_process_params["ImTransOpt"][:]).flatten().astype(int))
+    else:
+        sr_params["ImTransOpt"] = []
+
+    # Per-frame omega values for non-uniform scanning (MIDAS default: None = use linear formula)
+    if "omegaCenter" in zf_scan_params:
+        sr_params["omegaCenter"] = np.array(zf_scan_params["omegaCenter"][:]).flatten().astype(float)
+    else:
+        sr_params["omegaCenter"] = None
+
+    # Residual correction map path (MIDAS default: None = no residual correction)
+    sr_params["ResidualCorrectionMap"] = None
+    if "ResidualCorrectionMap" in zf_process_params:
+        val = zf_process_params["ResidualCorrectionMap"][0]
+        if isinstance(val, bytes):
+            val = val.decode()
+        if val:
+            sr_params["ResidualCorrectionMap"] = str(val)
 
     SRlogger.info(f"\t|Loading Zarr data")
     exData = np.array(zf["exchange"]["data"])[sr_params["SkipFrame"]:]
 
+    # Dark frames (MIDAS default: all 0.0 = no subtraction)
+    dark = np.zeros((sr_params["numPxZ"], sr_params["numPxY"]), dtype=np.float64)
+    if "dark" in zf["exchange"]:
+        dark_data = np.array(zf["exchange"]["dark"], dtype=np.float64)
+        if dark_data.ndim == 3:
+            dark = np.mean(dark_data, axis=0)
+        else:
+            dark = dark_data
+        SRlogger.info(f"\t|Loaded dark frame(s)")
+
+    # Flood field (MIDAS default: all 1.0 = no normalization)
+    flood = np.ones((sr_params["numPxZ"], sr_params["numPxY"]), dtype=np.float64)
+    if "flood" in zf["exchange"]:
+        flood_data = np.array(zf["exchange"]["flood"], dtype=np.float64)
+        if flood_data.ndim == 3:
+            flood = flood_data[0]
+        else:
+            flood = flood_data
+        SRlogger.info(f"\t|Loaded flood field")
+
+    # Mask (MIDAS default: all 0.0 = no masking)
+    mask = np.zeros((sr_params["numPxZ"], sr_params["numPxY"]), dtype=np.float64)
+    if "mask" in zf["exchange"]:
+        mask_data = np.array(zf["exchange"]["mask"], dtype=np.float64)
+        if mask_data.ndim == 3:
+            mask = mask_data[0]
+        else:
+            mask = mask_data
+        SRlogger.info(f"\t|Loaded mask")
+
+    # Apply ImTransOpt to dark/flood (MIDAS applies same transforms to correction frames)
+    for opt in sr_params["ImTransOpt"]:
+        if opt == 1:
+            dark = np.flip(dark, axis=1)
+            flood = np.flip(flood, axis=1)
+        elif opt == 2:
+            dark = np.flip(dark, axis=0)
+            flood = np.flip(flood, axis=0)
+        elif opt == 3:
+            dark = np.transpose(dark)
+            flood = np.transpose(flood)
+
     del zf
+
+    # Load residual correction map if specified
+    residual_corr_map = None
+    if sr_params["ResidualCorrectionMap"] is not None:
+        try:
+            rcm_path = sr_params["ResidualCorrectionMap"]
+            residual_corr_map = np.fromfile(rcm_path, dtype=np.float64).reshape(
+                sr_params["numPxZ"], sr_params["numPxY"])
+            SRlogger.info(f"\t|Loaded residual correction map: {rcm_path}")
+        except Exception as e:
+            SRlogger.warning(f"Could not load residual correction map: {e}")
+
     tf = time.time()
     t_run += tf - ts
     SRlogger.info(f"\t|Nr of frames={exData.shape[0]}; after skipping {sr_params['SkipFrame']} frames")
@@ -185,7 +274,7 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
 
     SRlogger.info(f"Creating detector RingNr map")
     ts = time.time()
-    RingNrmap = ringNr_map_on_detector(sr_params)
+    RingNrmap = ringNr_map_on_detector(sr_params, residual_corr_map=residual_corr_map)
     RingNrmap_savepath = os.path.join(midasZarrDir, "SR_out", "RingNrmap.npy")
     np.save(RingNrmap_savepath, RingNrmap)
     tf = time.time()
@@ -304,14 +393,27 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
             SRlogger.info(f"{'*'*5}| Frame {frame_i} skipped (csv exists).")
             continue
 
-        frame_arr = exData[frame_i]
+        frame_arr = exData[frame_i].astype(np.float64)
 
-        if sr_params["ImTransOpt"] == 1:
-            frame_arr = np.flip(frame_arr, axis=1)
-        if sr_params["ImTransOpt"] == 2:
-            frame_arr = np.flip(frame_arr, axis=0)
-        if sr_params["ImTransOpt"] == 3:
-            frame_arr = np.transpose(frame_arr)
+        # Apply image transformations in sequence (matching MIDAS applyImageTransformations_d)
+        for opt in sr_params["ImTransOpt"]:
+            if opt == 1:
+                frame_arr = np.flip(frame_arr, axis=1)
+            elif opt == 2:
+                frame_arr = np.flip(frame_arr, axis=0)
+            elif opt == 3:
+                frame_arr = np.transpose(frame_arr)
+
+        # Apply dark/flood/bc corrections (matching MIDAS lines 1430-1440)
+        frame_arr = (frame_arr - dark) / flood
+        frame_arr *= sr_params["bc"]
+
+        # Zero bad pixels
+        if sr_params["BadPxIntensity"] != 0:
+            frame_arr[frame_arr == sr_params["BadPxIntensity"]] = 0
+
+        # Apply mask (zero out masked pixels)
+        frame_arr[mask > 0] = 0
 
         ts = time.time()
         frame_goodCoords = np.zeros_like(frame_arr)
@@ -468,7 +570,10 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
         ts = time.time()
         spotID = int(0)
         orig_frame_index = frame_i + sr_params["SkipFrame"]
-        omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
+        if sr_params["omegaCenter"] is not None and orig_frame_index < len(sr_params["omegaCenter"]):
+            omega = float(sr_params["omegaCenter"][orig_frame_index])
+        else:
+            omega = sr_params["omega_start"] + (sr_params["omega_stepsize"] * orig_frame_index)
 
         R_patches = np.sqrt(
             (sr_params["Ypx_BC"] - (np.array(patches_Y00) + sr_config["spot_find_args"]["patch_size"] / 2))**2 +

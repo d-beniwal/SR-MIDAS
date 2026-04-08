@@ -42,38 +42,53 @@ def create_rotation_matrices(tx, ty, tz):
 
 
 # ----------------------------
-def create_distortion_map(RR, EE, p0, p1, p2, p3, px):
-    """Create the distortion map for the given parameters
+def create_distortion_map(RR, EE, sr_params):
+    """Full distortion model matching PeaksFittingOMPZarrRefactor.c:2721-2739.
+
+    Uses all 15 distortion parameters (p0-p14) with RhoD normalization.
+    When p4-p14 are 0 (default), this reduces to the basic 4-parameter model.
+
     Args:
         RR (np.ndarray): radial map (in microns)
-        EE (np.ndarray): polar angle map (spans from 180 to -180 degrees in clockwise direction)
-        p0 (float): distortion parameter
-        p1 (float): distortion parameter
-        p2 (float): distortion parameter
-        p3 (float): distortion parameter
-        px (float): pixel size in microns
+        EE (np.ndarray): polar angle map (degrees, spans 180 to -180 clockwise)
+        sr_params (dict): parameter dictionary containing p0-p14 and RhoD
     Returns:
         dist_fRE (np.ndarray): distortion factor map
     """
+    RhoD = sr_params["RhoD"]
+    RR_N = RR / RhoD
+    EE_T = np.deg2rad(90 - EE)
 
-    RR_N = RR / np.max(RR) # Normalized radial map
-    EE_T = 90 - EE # Transformed polar angle map
+    RN2 = RR_N ** 2
+    RN3 = RR_N ** 3
+    RN4 = RN2 * RN2
+    RN5 = RN4 * RR_N
+    RN6 = RN4 * RN2
 
-    # Distortion terms
-    dist_gRE = p0 * (RR_N**2) * np.cos(np.deg2rad(2*EE_T)) # 2-fold angular
-    dist_hRE = p1 * (RR_N**4) * np.cos(np.deg2rad(4*EE_T + p3)) # 4-fold angular
-    dist_kRE = p2 * (RR_N**2) # radial distortion
-    dist_fRE = 1 + dist_gRE + dist_hRE + dist_kRE # combined distortion factor
+    p = sr_params
+    dist_fRE = (
+        p["p0"]  * RN2 * np.cos(2.0 * EE_T + np.deg2rad(p["p6"]))
+      + p["p1"]  * RN4 * np.cos(4.0 * EE_T + np.deg2rad(p["p3"]))
+      + p["p2"]  * RN2
+      + p["p4"]  * RN6
+      + p["p5"]  * RN4
+      + p["p7"]  * RN4 * np.cos(EE_T + np.deg2rad(p["p8"]))
+      + p["p9"]  * RN3 * np.cos(3.0 * EE_T + np.deg2rad(p["p10"]))
+      + p["p11"] * RN5 * np.cos(5.0 * EE_T + np.deg2rad(p["p12"]))
+      + p["p13"] * RN6 * np.cos(6.0 * EE_T + np.deg2rad(p["p14"]))
+      + 1.0
+    )
 
     return dist_fRE
 
 
 # ----------------------------
-def ringNr_map_on_detector(sr_params):
+def ringNr_map_on_detector(sr_params, residual_corr_map=None):
     """Create the ring number map on the detector. Pixels that don't belong to any ring are marked with -1.
     Pixels that belong to a ring in sr_params["ringsToUse"] are marked with the ring index (starting from 0).
     Args:
         sr_params (dict): dictionary containing the parameters for the super-resolution process
+        residual_corr_map (np.ndarray or None): optional per-pixel residual correction map
     Returns:
         RingNrmap (arr): ring number map on the detector
     """
@@ -104,11 +119,12 @@ def ringNr_map_on_detector(sr_params):
     EE[YY <= 0] = np.rad2deg(np.arccos(ZZ[YY<=0] / (np.sqrt(YY[YY<=0]**2 + ZZ[YY<=0]**2))))
     EE[YY > 0] = np.rad2deg(- np.arccos(ZZ[YY>0] / (np.sqrt(YY[YY>0]**2 + ZZ[YY>0]**2))))
 
-    dist_fRE = create_distortion_map(RR, EE,
-                                    sr_params["p0"], sr_params["p1"], sr_params["p2"], sr_params["p3"],
-                                    sr_params["pxSize"])
+    dist_fRE = create_distortion_map(RR, EE, sr_params)
 
     Rmap = RR * dist_fRE / sr_params["pxSize"]
+
+    if residual_corr_map is not None:
+        Rmap += residual_corr_map
 
     RingNrmap = np.full(det_shape, -1, dtype=int)
 
@@ -116,4 +132,4 @@ def ringNr_map_on_detector(sr_params):
         ring_mask = np.abs(Rmap - R) <= (sr_params["ring_width"]/sr_params["pxSize"])
         RingNrmap[ring_mask] = i
 
-    return (RingNrmap)
+    return RingNrmap
