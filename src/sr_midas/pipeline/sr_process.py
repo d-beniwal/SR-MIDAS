@@ -264,8 +264,10 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
     SRlogger.info(f"Reading ring positions from '{midasZarrDir}hkls.csv'")
     ts = time.time()
     df_hkls = read_hkls_csv(f"{midasZarrDir}hkls.csv")
-    rings_Rpx = (df_hkls["Radius"].unique() / sr_params["pxSize"]).tolist()
-    rings_to_use_Rpx = [rings_Rpx[int(i) - 1] for i in sr_params['ringsToUse']]
+
+    ring_to_radius = df_hkls.groupby("RingNr")["Radius"].first()
+    rings_to_use_Rpx = [(ring_to_radius[i] / sr_params["pxSize"]) for i in sr_params['ringsToUse']]
+
     sr_params["rings_to_use_Rpx"] = rings_to_use_Rpx
     tf = time.time()
     t_run += tf - ts
