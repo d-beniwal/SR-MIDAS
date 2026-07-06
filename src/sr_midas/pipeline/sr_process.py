@@ -61,8 +61,13 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
         peak_fit_method (str or None; default=None): which peak-fit routine to
             use in the all-GPU pipeline branch. When None (the default), the
             value is read from `sr_config["peak_fit_method"]` (bundled JSON
-            ships with "gpu_adam"). Pass a string to override per-call.
+            ships with "midas_lm"). Pass a string to override per-call.
             Recognised values:
+              * "midas_lm"        — DEFAULT. Fit SR patches with the real
+                                    midas_peakfit Levenberg-Marquardt engine
+                                    (identical pseudo-Voigt model/seeds as MIDAS's
+                                    no-SR peakfit). Needs the 'midas-peakfit'
+                                    package; falls back to gpu_adam if absent.
               * "gpu_adam"        — fast batched Adam (no BG term)
               * "gpu_midas_style" — batched Adam on GPU with MIDAS-style BG,
                                     moment-based init, region-dependent bounds,
@@ -433,10 +438,22 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
     #      either SRconfig_path or the bundled cnnsr_sr_config.json)
     #   3. fallback to "gpu_adam"
     if peak_fit_method is None:
-        peak_fit_method = str(sr_config.get("peak_fit_method", "gpu_adam"))
+        peak_fit_method = str(sr_config.get("peak_fit_method", "midas_lm"))
     SRlogger.info(f"\t|peak_fit_method (resolved): {peak_fit_method}")
 
     peak_fit_fn = None
+    # midas_lm (DEFAULT): fit the SR patches with the REAL midas_peakfit LM engine
+    # (identical algorithm/equation to MIDAS's no-SR peakfit_torch). Requires the
+    # 'midas-peakfit' package; falls back to gpu_adam if it is not installed.
+    if peak_fit_method == "midas_lm":
+        try:
+            from sr_midas.pipeline._peakfit_midas_lm import midas_lm_fit_frame_patches
+            peak_fit_fn = midas_lm_fit_frame_patches
+            SRlogger.info(f"\t|peak_fit_method: midas_lm (SR fit via the real midas_peakfit LM engine — DEFAULT)")
+        except ImportError as _e:
+            SRlogger.warning(f"\t|peak_fit_method: midas_lm unavailable ({_e}); "
+                             f"falling back to gpu_adam. Install 'midas-peakfit' (or midas-suite[sr]).")
+            peak_fit_method = "gpu_adam"
     if peak_fit_method == "midas_style":
         from sr_midas.pipeline._peakfit_midas_style import midas_style_fit_frame_patches
         peak_fit_fn = midas_style_fit_frame_patches
@@ -446,11 +463,13 @@ def run_sr_process(midasZarrDir, srfac=8, SRconfig_path=None,
         peak_fit_fn = gpu_midas_fit_frame_patches
         SRlogger.info(f"\t|peak_fit_method: gpu_midas_style (batched-Adam on GPU with BG + MIDAS init/bounds/rules)")
     elif peak_fit_method == "gpu_adam":
-        SRlogger.info(f"\t|peak_fit_method: gpu_adam (default batched-Adam, BG=0)")
+        SRlogger.info(f"\t|peak_fit_method: gpu_adam (batched-Adam, BG=0)")
+    elif peak_fit_method == "midas_lm":
+        pass  # already wired above
     else:
         SRlogger.warning(
             f"\t|peak_fit_method: unknown value '{peak_fit_method}' -- "
-            f"falling back to gpu_adam. Valid: gpu_adam, gpu_midas_style, midas_style."
+            f"falling back to gpu_adam. Valid: midas_lm, gpu_adam, gpu_midas_style, midas_style."
         )
 
     # Accumulators for consolidated binary output

@@ -48,6 +48,11 @@ dependencies = [
     "pyqtgraph",
     "PyQt5",
     "PyQt6",
+    # midas_lm (default peak-fit): fit SR patches with the real MIDAS packages
+    # Levenberg-Marquardt engine (identical algorithm to MIDAS no-SR peakfit).
+    "midas-peakfit>=0.4.0",
+    "midas-diffract>=0.1.2",
+    "midas-stress>=0.7.0",
 ]
 
 [project.optional-dependencies]

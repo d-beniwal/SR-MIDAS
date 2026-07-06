@@ -7,8 +7,8 @@
     "lrsz": 20,
     "edge_bound_cutoff_fac": 2.5,
     "batch_size": 400,
-    "peak_fit_method": "gpu_adam",
-    "_peak_fit_method_about": "Which SR-MIDAS peak-fit routine to use in run_sr_process. Options: 'gpu_adam' (default, fast batched-Adam on GPU, no BG term), 'gpu_midas_style' (batched-Adam on GPU with MIDAS-style BG + moment-init + region-dependent bounds + MIDAS IntegratedIntensity/NrPixels rules), 'midas_style' (CPU per-patch Nelder-Mead with BG, very slow; for methodology verification only).",
+    "peak_fit_method": "midas_lm",
+    "_peak_fit_method_about": "Which SR-MIDAS peak-fit routine to use in run_sr_process. Options: 'midas_lm' (DEFAULT: fit SR patches with the real midas_peakfit Levenberg-Marquardt engine, identical pseudo-Voigt model/seeds to MIDAS's no-SR peakfit; needs the midas-peakfit package, falls back to gpu_adam if absent), 'gpu_adam' (fast batched-Adam on GPU, no BG term), 'gpu_midas_style' (batched-Adam on GPU with MIDAS-style BG + moment-init + region-dependent bounds + MIDAS IntegratedIntensity/NrPixels rules), 'midas_style' (CPU per-patch Nelder-Mead with BG, very slow; for methodology verification only).",
     "mods_to_use": {
         "SRx2": {
             "mod_dir": "x1_x2-pst60000-240117_arch3-itrOut",
