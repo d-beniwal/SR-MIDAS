@@ -110,6 +110,26 @@ sr-midas-predict              # evaluate predictions on a patchstore
 sr-midas-process              # apply trained model to full MIDAS data
 ```
 
+### One-command training / fine-tuning: `sr-midas-auto-train`
+
+`sr-midas-auto-train` runs the whole `peakbank → patchstore → train x2/x4/x8 →
+sr_config.json` chain from a single JSON config. Point it at any MIDAS
+reconstruction folder to **train new models from scratch** or **fine-tune the
+bundled pretrained models** on that dataset's fitted peaks; it emits an
+`sr_config.json` you pass straight to `sr-midas-process`. It reads peaks from
+either the legacy per-frame `Temp/*_PS.csv` or the modern consolidated
+`Temp/AllPeaks_PS.bin`.
+
+```bash
+sr-midas-auto-train -config my_train_config.json
+# minimal fine-tune config:
+#   {"mode": "finetune", "midas_dir": ["/path/to/recon/LayerNr_1"],
+#    "output_dir": "/path/to/out", "peak_source": "auto"}
+```
+
+See [`docs/auto_train_manual.md`](docs/auto_train_manual.md) for the full
+config reference (modes, adaptive error gate, per-stage batch sizes, etc.).
+
 ---
 
 ## Adding SR-MIDAS worflow to MIDAS FF-HEDM workflow

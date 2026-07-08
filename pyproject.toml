@@ -68,6 +68,7 @@ sr-midas-hp-optimize       = "sr_midas._cli.hp_optimize_cli:main"
 sr-midas-predict           = "sr_midas._cli.predict_cli:main"
 sr-midas-create-pred-pst   = "sr_midas._cli.create_pred_patchstore_cli:main"
 sr-midas-process           = "sr_midas._cli.sr_process_cli:main"
+sr-midas-auto-train        = "sr_midas._cli.auto_train_cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

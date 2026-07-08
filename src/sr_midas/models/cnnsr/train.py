@@ -102,18 +102,32 @@ def train_cnnsr(args):
 
     b_trainContinue = False
     modInitCount = 0
+    # Cap on model re-initialisations.  The convergence gate below re-inits the
+    # model whenever the first `ecItr` epochs fail to drive the loss under
+    # `ecVal`; without a cap this loops forever on hard/quick configs (and, when
+    # fine-tuning, needlessly re-loads the checkpoint).  After this many attempts
+    # we proceed with the current weights.
+    maxModInit = int(getattr(args, "maxModInit", 3) or 3)
+
+    # DataLoader prefetch is measured in *batches per worker*.  The historical
+    # value (args.mbsz, i.e. 512) prefetched 512 batches × mbsz samples per
+    # worker — tens of GB for the large x8 (160×160) patches, which can OOM the
+    # host (especially on a shared node).  Use a small bounded prefetch, and
+    # omit it entirely when there are no workers (PyTorch requires that).
+    _nwork = int(args.nwork)
+    _dl_kwargs = {"num_workers": _nwork, "pin_memory": True}
+    if _nwork > 0:
+        _dl_kwargs["prefetch_factor"] = 4
 
     while b_trainContinue == False:
         modInitCount += 1
         logging.info(f"\n---------Initiating MODEL: Count ({modInitCount})-----------")
 
         dl_train = DataLoader(dataset=ds_train, batch_size=args.mbsz, shuffle=True,
-                              num_workers=args.nwork, prefetch_factor=args.mbsz,
-                              drop_last=True, pin_memory=True)
+                              drop_last=True, **_dl_kwargs)
 
         dl_valid = DataLoader(dataset=ds_valid, batch_size=args.mbsz, shuffle=False,
-                              num_workers=args.nwork, prefetch_factor=args.mbsz,
-                              drop_last=False, pin_memory=True)
+                              drop_last=False, **_dl_kwargs)
 
         logging.info(f"Loaded {len(ds_train)} training / {len(ds_valid)} validation samples.")
 
@@ -191,6 +205,12 @@ def train_cnnsr(args):
             torch.save(model.state_dict(), model_savepath)
 
         if loss.cpu().detach().numpy() < args.ecVal:
+            b_trainContinue = True
+        elif modInitCount >= maxModInit:
+            logging.info(
+                f"--------- Convergence gate not met after {modInitCount} "
+                f"init(s) (loss={loss.cpu().detach().numpy():.5f} >= "
+                f"ecVal={args.ecVal}); proceeding with current weights -----------")
             b_trainContinue = True
 
     logging.info("---------------------------------\n")

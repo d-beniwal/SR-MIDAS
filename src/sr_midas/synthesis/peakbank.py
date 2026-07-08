@@ -14,6 +14,72 @@ from sr_midas.synthesis import peak_artist
 
 
 # ----------------------------
+def _build_frame_df_provider(sample_dir, padding, peak_source="auto"):
+    """Build a callable mapping 0-based (post-SkipFrame) frame index -> peak
+    DataFrame for one MIDAS analysis directory.
+
+    Handles both the legacy layout (one ``Temp/<stem>_<frame>_PS.csv`` per frame)
+    and the modern MIDAS layout (a single consolidated
+    ``Temp/AllPeaks_PS.bin``).  Frame indexing is identical between the two:
+    bin frame index ``f`` corresponds to CSV frame number ``f + 1``.
+
+    Args:
+        sample_dir (str): MIDAS analysis directory (contains ``Temp/``).
+        padding (int): zero-pad width of the frame number in CSV filenames.
+        peak_source (str): "auto" (prefer CSVs, fall back to consolidated bin),
+            "csv" (force per-frame CSVs), or "consolidated" (force the bin).
+
+    Returns:
+        (provider, source_name): ``provider(frame_i)`` returns a DataFrame or
+        None (no peaks / missing frame); ``source_name`` is "csv" or
+        "consolidated".
+    """
+    temp_dir = os.path.join(sample_dir, "Temp")
+    csv_files = []
+    if os.path.isdir(temp_dir):
+        csv_files = sorted(i for i in os.listdir(temp_dir) if i.endswith("_PS.csv"))
+    bin_path = os.path.join(temp_dir, "AllPeaks_PS.bin")
+    has_bin = os.path.isfile(bin_path)
+
+    src = peak_source
+    if src == "auto":
+        src = "csv" if csv_files else ("consolidated" if has_bin else "csv")
+
+    if src == "csv":
+        if not csv_files:
+            raise FileNotFoundError(
+                f"No per-frame *_PS.csv files found in {temp_dir}. "
+                f"If this dataset uses the modern consolidated format, set "
+                f"peak_source='consolidated' (AllPeaks_PS.bin "
+                f"{'is' if has_bin else 'is NOT'} present)."
+            )
+
+        def provider(frame_i):
+            suffix = f"{str(frame_i + 1).zfill(padding)}_PS.csv"
+            matches = [i for i in csv_files if i.endswith(suffix)]
+            if not matches:
+                return None
+            return pd.read_csv(os.path.join(temp_dir, matches[0]), delimiter="\t")
+
+        return provider, "csv"
+
+    if src == "consolidated":
+        if not has_bin:
+            raise FileNotFoundError(
+                f"No AllPeaks_PS.bin found in {temp_dir} (peak_source='consolidated')."
+            )
+        from sr_midas.pipeline._consolidated_io import read_allpeaks_ps_frame_dfs
+        frame_dfs = read_allpeaks_ps_frame_dfs(bin_path)
+
+        def provider(frame_i):
+            return frame_dfs.get(frame_i)
+
+        return provider, "consolidated"
+
+    raise ValueError(f"Unknown peak_source '{peak_source}' (use auto/csv/consolidated)")
+
+
+# ----------------------------
 def create_peakbank(config):
     """Create a peakbank of MIDAS-fitted peaks.
     Loads peak shapes, reconstructs each peak, computes reconstruction error,
@@ -48,6 +114,8 @@ def create_peakbank(config):
     save_exp_patches = config["save_exp_patches"]
     dir_ignore = config["dir_ignore"]
     save_frame_gen = config["save_frame_gen"]
+    peak_source = config.get("peak_source", "auto")
+    max_frames = config.get("max_frames", None)  # optional cap (testing/debug)
 
     if str(save_frame_gen).lower() in ["true", "True", "t", "1"]:
         frame_gen_savedir = os.path.join(peakbank_savedir, "frame_gen")
@@ -62,11 +130,8 @@ def create_peakbank(config):
         df_sample_peaks = pd.DataFrame()
 
         print("Midas data directory running: ", sample_dir)
-        midas_peaks_csv_dir = os.path.join(sample_dir, "Temp")
         midas_zip_filename = [i for i in os.listdir(sample_dir) if i.endswith(".MIDAS.zip")][0]
         midas_zip_filepath = os.path.join(sample_dir, midas_zip_filename)
-
-        csv_filenames = sorted([i for i in os.listdir(midas_peaks_csv_dir) if i.endswith(".csv")])
 
         zf, exData, exDark, exBright = midas_Zarr_zip(midas_zip_filepath)
         exData[exData < I_thresh] = 0
@@ -90,6 +155,13 @@ def create_peakbank(config):
         exData = exData[SkipFrame:]
         nr_frames = exData.shape[0]
 
+        frame_df_provider, peak_src_used = _build_frame_df_provider(
+            sample_dir, Padding, peak_source=peak_source)
+        print(f"  Peak source: {peak_src_used}")
+
+        if max_frames is not None:
+            nr_frames = min(nr_frames, int(max_frames))
+
         for frame_i in range(0, nr_frames):
 
             frame_exp = exData[frame_i]
@@ -98,9 +170,9 @@ def create_peakbank(config):
             if ImTransOpt == 2: frame_exp = np.flip(frame_exp, axis=0)
             if ImTransOpt == 3: frame_exp = np.transpose(frame_exp)
 
-            csv_fn = [i for i in csv_filenames if i.endswith(f"{str(frame_i+1).zfill(Padding)}_PS.csv")][0]
-            midas_peaks_csv_filepath = os.path.join(midas_peaks_csv_dir, csv_fn)
-            df_frame_peaks = pd.read_csv(midas_peaks_csv_filepath, delimiter="\t")
+            df_frame_peaks = frame_df_provider(frame_i)
+            if df_frame_peaks is None or len(df_frame_peaks) == 0:
+                continue
 
             spot_max_peaks = 1
             df_frame_peaks = df_frame_peaks[df_frame_peaks["nPeaks"] <= spot_max_peaks].reset_index(drop=True)

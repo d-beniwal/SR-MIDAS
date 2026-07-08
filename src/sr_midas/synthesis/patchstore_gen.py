@@ -346,6 +346,10 @@ def create_patchstore(args):
 
         group = h5file.create_group("pstCreationArgs")
         for key, value in pst_args.items():
+            # h5py cannot serialise None (and other non-scalar/str objects);
+            # store those as their string form so the args stay reproducible.
+            if value is None or not isinstance(value, (int, float, str, bytes, bool)):
+                value = str(value)
             group.create_dataset(key, data=value)
 
     print("DONE.", flush=True)

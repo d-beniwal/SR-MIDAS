@@ -17,6 +17,7 @@ import glob
 import logging
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import h5py
@@ -35,11 +36,32 @@ SEP = os.sep
 # These match the hyperparameters used to train the bundled pretrained models.
 
 DEFAULTS = {
+    # Mode: "scratch" (train from random init) or "finetune" (warm-start from
+    # existing checkpoints — bundled pretrained by default).
+    "mode": "scratch",
+
     # Peakbank
     "cvsz": 50,
     "srfac": 16,
     "I_thresh": 30,
     "peak_recon_err_threshold": 0.25,
+    # Adaptive quality gate. The single-peak reconstruction error is on a
+    # dataset-dependent scale (it depends on detector background, which frame
+    # preprocessing in the peakbank does not remove), so a fixed absolute cutoff
+    # like 0.25 can accept everything on one dataset and reject everything on
+    # another. When `err_percentile` is set (not null), the workflow keeps the
+    # cleanest `err_percentile`% of peaks by reconstruction error (computed from
+    # THIS dataset) instead of applying the absolute `err_cut`/
+    # `peak_recon_err_threshold`. Set to null to fall back to the absolute
+    # cutoffs (legacy behaviour).
+    "err_percentile": 60,
+    # Where to read MIDAS-fitted peaks from: "auto" (per-frame Temp/*_PS.csv if
+    # present, else the modern consolidated Temp/AllPeaks_PS.bin), "csv", or
+    # "consolidated".
+    "peak_source": "auto",
+    # Optional cap on frames read per dataset when building the peakbank
+    # (null = all frames). Useful for quick smoke tests.
+    "max_frames": None,
 
     # Patchstore
     "n_patches": 60000,
@@ -61,6 +83,13 @@ DEFAULTS = {
     "lr": 0.0001,
     "loss_fn": "mse",
     "batch_size": 512,
+    # Per-stage batch-size overrides. The x8 stage operates on 160x160 patches
+    # through a 256-channel CNN, so a batch of 512 needs ~50 GB of GPU memory and
+    # OOMs on typical cards. x8 therefore defaults to a much smaller batch. Any
+    # of these can be set explicitly; each falls back to `batch_size`.
+    "batch_size_x2": None,
+    "batch_size_x4": None,
+    "batch_size_x8": 128,
     "max_itr_x2": 5000,
     "max_itr_x4": 1000,
     "max_itr_x8": 1000,
@@ -69,6 +98,24 @@ DEFAULTS = {
     "ec_itr": 10,
     "n_workers": 1,
     "pred_batch_size": 500,
+    "maxModInit": 3,
+
+    # Fine-tune base models. null -> use the bundled pretrained models (the ones
+    # referenced by the packaged cnnsr_sr_config.json). Provide a path to an
+    # sr_config.json to warm-start from a previous (auto-)training run, or an
+    # explicit per-stage dict:
+    #   {"SRx2": {"mod_dir": "...", "mod_itr": 4975}, "SRx4": {...}, "SRx8": {...}}
+    "base_models": None,
+}
+
+# Overrides applied on top of DEFAULTS when mode == "finetune" and the user has
+# not set the key explicitly. Fine-tuning needs far fewer epochs and a gentler
+# learning rate than training from scratch.
+FINETUNE_DEFAULTS = {
+    "lr": 0.00002,
+    "max_itr_x2": 300,
+    "max_itr_x4": 300,
+    "max_itr_x8": 300,
 }
 
 
@@ -85,6 +132,73 @@ def _find_best_iteration(mod_dir):
         if match:
             itrs.append(int(match.group(1)))
     return max(itrs)
+
+
+def _pretrained_root():
+    """Absolute path to the bundled pretrained-model directory."""
+    import importlib.resources as ilr
+    return str(ilr.files("sr_midas.models.cnnsr") / "pretrained")
+
+
+def _resolve_base_models(base_models_cfg):
+    """Resolve the checkpoints to warm-start from for fine-tuning.
+
+    Args:
+        base_models_cfg: one of
+            - None: use the bundled pretrained models referenced by the packaged
+              cnnsr_sr_config.json.
+            - str: path to an sr_config.json whose mods_to_use block names the
+              base models (e.g. the output of a previous auto-train run).
+            - dict: explicit {"SRx2"/"SRx4"/"SRx8": {"mod_dir","mod_itr"}}.
+
+    Returns:
+        dict {"SRx2"/"SRx4"/"SRx8": {"mod_dir": <abs>, "mod_itr": int,
+        "arch": <str>, "chkpt": <abs .pth>}}.  mod_dir entries that are not
+        absolute are resolved against the bundled pretrained directory.
+    """
+    import importlib.resources as ilr
+
+    if base_models_cfg is None:
+        cfg_file = ilr.files("sr_midas.models.cnnsr") / "cnnsr_sr_config.json"
+        with cfg_file.open("r") as f:
+            mods = json.load(f)["mods_to_use"]
+        base_models_cfg = {
+            k: {"mod_dir": mods[k]["mod_dir"], "mod_itr": mods[k]["mod_itr"]}
+            for k in ("SRx2", "SRx4", "SRx8")
+        }
+    elif isinstance(base_models_cfg, str):
+        with open(base_models_cfg, "r") as f:
+            mods = json.load(f)["mods_to_use"]
+        base_models_cfg = {
+            k: {"mod_dir": mods[k]["mod_dir"], "mod_itr": mods[k]["mod_itr"]}
+            for k in ("SRx2", "SRx4", "SRx8")
+        }
+
+    pre_root = _pretrained_root()
+    resolved = {}
+    for stage in ("SRx2", "SRx4", "SRx8"):
+        if stage not in base_models_cfg:
+            raise ValueError(f"base_models missing entry for {stage}")
+        mod_dir = base_models_cfg[stage]["mod_dir"]
+        if not os.path.isabs(mod_dir):
+            mod_dir = os.path.join(pre_root, mod_dir)
+        mod_dir = os.path.abspath(mod_dir)
+
+        mod_itr = base_models_cfg[stage].get("mod_itr")
+        if mod_itr is None:
+            mod_itr = _find_best_iteration(mod_dir)
+
+        args_path = os.path.join(mod_dir, "_train_args.json")
+        with open(args_path, "r") as f:
+            arch = json.load(f)["arch"]
+
+        chkpt = os.path.join(mod_dir, f"mod-it{mod_itr}.pth")
+        if not os.path.exists(chkpt):
+            raise FileNotFoundError(f"Base checkpoint not found: {chkpt}")
+
+        resolved[stage] = {"mod_dir": mod_dir, "mod_itr": int(mod_itr),
+                           "arch": arch, "chkpt": chkpt}
+    return resolved
 
 
 def _extract_beam_center(midas_dir):
@@ -117,7 +231,9 @@ def _create_pred_patchstore(pst_path, mod_dir, mod_itr,
         mod_dir=mod_dir, mod_itr=mod_itr, torch_devs=torch_devs
     )
 
-    patch_arr, *_ = load_patchstore_h5data(pst_path, only_patch_arrays=True)
+    # only_patch_arrays=True returns the patch-array dict directly (not a tuple),
+    # so index it straight away — do NOT unpack (that would iterate dict keys).
+    patch_arr = load_patchstore_h5data(pst_path, only_patch_arrays=True)
     X_in = patch_arr[f"SRx{srfac_in}"]
     X_in = X_in[:, sr_mod_ch, :, :]
 
@@ -200,7 +316,17 @@ def run_auto_train(config_path):
     with open(config_path, "r") as f:
         user_config = json.load(f)
 
-    cfg = {**DEFAULTS, **user_config}
+    mode = str(user_config.get("mode", DEFAULTS["mode"])).lower()
+    if mode not in ("scratch", "finetune"):
+        raise ValueError(f"'mode' must be 'scratch' or 'finetune', got '{mode}'")
+
+    if mode == "finetune":
+        # Apply gentler fine-tune defaults, but only for keys the user did not set.
+        ft = {k: v for k, v in FINETUNE_DEFAULTS.items() if k not in user_config}
+        cfg = {**DEFAULTS, **ft, **user_config}
+    else:
+        cfg = {**DEFAULTS, **user_config}
+    cfg["mode"] = mode
 
     if "midas_dir" not in cfg:
         raise ValueError("Config must include 'midas_dir' (list of MIDAS data directories)")
@@ -231,6 +357,30 @@ def run_auto_train(config_path):
     logger.info(f"Config file: {os.path.abspath(config_path)}")
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"MIDAS directories: {cfg['midas_dir']}")
+    logger.info(f"Mode: {mode.upper()}")
+    logger.info(f"Peak source: {cfg['peak_source']}")
+
+    # Adaptive vs absolute quality gate.  When err_percentile is set we keep the
+    # cleanest N% of peaks by reconstruction error, computed from this dataset,
+    # instead of a fixed absolute cutoff (see DEFAULTS note).
+    use_adaptive_err = cfg.get("err_percentile") is not None
+    logger.info(
+        f"Error gate: {'adaptive p' + str(cfg['err_percentile']) if use_adaptive_err else 'absolute'}")
+
+    # Per-stage batch sizes (x8 is memory-heavy; see DEFAULTS note).
+    bs_x2 = cfg.get("batch_size_x2") or cfg["batch_size"]
+    bs_x4 = cfg.get("batch_size_x4") or cfg["batch_size"]
+    bs_x8 = cfg.get("batch_size_x8") or cfg["batch_size"]
+    logger.info(f"Batch sizes: x2={bs_x2}, x4={bs_x4}, x8={bs_x8}")
+
+    # Resolve fine-tune base checkpoints up front so failures surface early.
+    base_models = None
+    if mode == "finetune":
+        base_models = _resolve_base_models(cfg.get("base_models"))
+        logger.info("Fine-tune base models:")
+        for stage in ("SRx2", "SRx4", "SRx8"):
+            bm = base_models[stage]
+            logger.info(f"  {stage}: {bm['chkpt']}  (arch={bm['arch']})")
 
     # Save resolved config for reproducibility
     resolved_cfg_path = os.path.join(output_dir, "auto_train_config_resolved.json")
@@ -262,17 +412,36 @@ def run_auto_train(config_path):
             "midas_dir": cfg["midas_dir"],
             "peakbank_savedir": peakbank_dir,
             "peakbank_savename": "peakbank.csv",
-            "peak_recon_err_threshold": cfg["peak_recon_err_threshold"],
+            # When adaptive, keep ALL peaks in the bank (with their errors) so the
+            # percentile can be computed from the full distribution; the real cut
+            # is applied at patchstore creation via err_cut below.
+            "peak_recon_err_threshold": None if use_adaptive_err else cfg["peak_recon_err_threshold"],
             "cvsz": cfg["cvsz"],
             "srfac": cfg["srfac"],
             "I_thresh": cfg["I_thresh"],
             "save_exp_patches": False,
             "dir_ignore": [],
             "save_frame_gen": False,
+            "peak_source": cfg["peak_source"],
+            "max_frames": cfg["max_frames"],
         }
         create_peakbank(peakbank_config)
         logger.info(f"  Saved: {peakbank_path}")
         logger.info(f"  Time: {time.time() - ts:.2f} s")
+
+    # Resolve the effective reconstruction-error cutoff used by patchstore
+    # creation.  Adaptive mode derives it from this dataset's error distribution.
+    if use_adaptive_err:
+        _dfpb = pd.read_csv(peakbank_path)
+        _errs = _dfpb["error_reconstruction"].to_numpy()
+        err_cut_eff = float(np.percentile(_errs, cfg["err_percentile"]))
+        n_keep = int((_errs < err_cut_eff).sum())
+        logger.info(
+            f"  Adaptive err_cut = p{cfg['err_percentile']} = {err_cut_eff:.4f} "
+            f"(keeps {n_keep}/{len(_errs)} peaks; median err={np.median(_errs):.3f})")
+    else:
+        err_cut_eff = cfg["err_cut"]
+        logger.info(f"  Absolute err_cut = {err_cut_eff}")
 
     # ── 4. Create patchstore ──
     logger.info("")
@@ -299,7 +468,7 @@ def run_auto_train(config_path):
             "pSepMin": cfg["peak_sep_min"],
             "pSepMax": cfg["peak_sep_max"],
             "varR": cfg["var_R"],
-            "errCut": cfg["err_cut"],
+            "errCut": err_cut_eff,
             "integIntCut": cfg["integ_int_cut"],
             "midasIthresh": cfg["midas_I_thresh"],
             "peakImin": cfg["peak_I_min"],
@@ -333,18 +502,19 @@ def run_auto_train(config_path):
             "outSRx": 2,
             "useRch": "false",
             "useEtach": "false",
-            "arch": cfg["arch"],
+            "arch": base_models["SRx2"]["arch"] if mode == "finetune" else cfg["arch"],
             "lr": cfg["lr"],
             "lossF": cfg["loss_fn"],
-            "mbsz": cfg["batch_size"],
+            "mbsz": bs_x2,
             "maxItr": cfg["max_itr_x2"],
             "trainFrac": cfg["train_frac"],
             "nwork": cfg["n_workers"],
             "ecVal": cfg["ec_val"],
             "ecItr": cfg["ec_itr"],
+            "maxModInit": cfg["maxModInit"],
             "inPstPath": None,
             "outPstPath": None,
-            "loadChkpt": None,
+            "loadChkpt": base_models["SRx2"]["chkpt"] if mode == "finetune" else None,
             "trainOutDir": models_dir,
         })
         logger.info(f"  Saved: {x2_mod_dir}")
@@ -395,18 +565,19 @@ def run_auto_train(config_path):
             "outSRx": 4,
             "useRch": "false",
             "useEtach": "false",
-            "arch": cfg["arch"],
+            "arch": base_models["SRx4"]["arch"] if mode == "finetune" else cfg["arch"],
             "lr": cfg["lr"],
             "lossF": cfg["loss_fn"],
-            "mbsz": cfg["batch_size"],
+            "mbsz": bs_x4,
             "maxItr": cfg["max_itr_x4"],
             "trainFrac": cfg["train_frac"],
             "nwork": cfg["n_workers"],
             "ecVal": cfg["ec_val"],
             "ecItr": cfg["ec_itr"],
+            "maxModInit": cfg["maxModInit"],
             "inPstPath": x2pred_path,
             "outPstPath": None,
-            "loadChkpt": None,
+            "loadChkpt": base_models["SRx4"]["chkpt"] if mode == "finetune" else None,
             "trainOutDir": models_dir,
         })
         logger.info(f"  Saved: {x4_mod_dir}")
@@ -455,18 +626,19 @@ def run_auto_train(config_path):
             "outSRx": 8,
             "useRch": "false",
             "useEtach": "false",
-            "arch": cfg["arch"],
+            "arch": base_models["SRx8"]["arch"] if mode == "finetune" else cfg["arch"],
             "lr": cfg["lr"],
             "lossF": cfg["loss_fn"],
-            "mbsz": cfg["batch_size"],
+            "mbsz": bs_x8,
             "maxItr": cfg["max_itr_x8"],
             "trainFrac": cfg["train_frac"],
             "nwork": cfg["n_workers"],
             "ecVal": cfg["ec_val"],
             "ecItr": cfg["ec_itr"],
+            "maxModInit": cfg["maxModInit"],
             "inPstPath": x4pred_path,
             "outPstPath": None,
-            "loadChkpt": None,
+            "loadChkpt": base_models["SRx8"]["chkpt"] if mode == "finetune" else None,
             "trainOutDir": models_dir,
         })
         logger.info(f"  Saved: {x8_mod_dir}")
